@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         nodeseek-sou
 // @namespace    https://github.com/mskatoni/nodeseek-sou
-// @version      0.2.2
+// @version      0.2.3
 // @description  低内存友好的 NodeSeek 多页帖子抓取、过滤和排序工具。
 // @author       mskatoni
 // @homepageURL  https://github.com/mskatoni/nodeseek-sou
@@ -26,6 +26,7 @@
   const DEFAULT_USER_LEVEL_CONCURRENCY = 2;
   const MIN_USER_LEVEL_CONCURRENCY = 1;
   const MAX_USER_LEVEL_CONCURRENCY = 5;
+  const DEFAULT_LEVEL_OPERATOR = "lte";
   const USER_LEVEL_CACHE_MAX = 1200;
   const USER_LEVEL_FAILED_TTL_MS = 20 * 60 * 1000;
   const USER_LEVEL_429_COOLDOWN_MS = 60 * 1000;
@@ -212,6 +213,21 @@
     return Math.min(Math.max(n, MIN_USER_LEVEL_CONCURRENCY), MAX_USER_LEVEL_CONCURRENCY);
   }
 
+  function clampLevelOperator(value) {
+    return value === "gte" ? "gte" : DEFAULT_LEVEL_OPERATOR;
+  }
+
+  function getLevelOperatorLabel(operator) {
+    return clampLevelOperator(operator) === "gte" ? ">=" : "<=";
+  }
+
+  function shouldHideAuthorLevel(authorLevel, threshold, operator) {
+    if (threshold == null || authorLevel == null) return false;
+    return clampLevelOperator(operator) === "gte"
+      ? authorLevel >= threshold
+      : authorLevel <= threshold;
+  }
+
   function clampBlockThreshold(value) {
     const n = Number.parseInt(String(value ?? ""), 10);
     if (!Number.isFinite(n) || n < 0) return 0;
@@ -268,8 +284,12 @@
           }
         }
 
-        if (filters.maxBlockedLevel != null && record.authorLevel != null && record.authorLevel <= filters.maxBlockedLevel) {
-          return false;
+        if (filters.maxBlockedLevel != null && record.authorLevel != null) {
+          const operator = filters.levelOperator === "gte" ? "gte" : "lte";
+          const shouldHide = operator === "gte"
+            ? record.authorLevel >= filters.maxBlockedLevel
+            : record.authorLevel <= filters.maxBlockedLevel;
+          if (shouldHide) return false;
         }
 
         return true;
@@ -1151,7 +1171,7 @@
       .sort((a, b) => (b.count - a.count) || a.authorName.localeCompare(b.authorName, "zh-Hans-CN"));
   }
 
-  function makeFilters(days, usernameText, maxBlockedLevel, levelConcurrency) {
+  function makeFilters(days, usernameText, maxBlockedLevel, levelOperator, levelConcurrency) {
     const usernames = parseUsernameFilter(usernameText);
     const cutoff = days > 0 ? Date.now() - days * DAY_MS : 0;
 
@@ -1159,6 +1179,7 @@
       days,
       usernames,
       maxBlockedLevel,
+      levelOperator: clampLevelOperator(levelOperator),
       levelConcurrency,
       cutoff,
     };
@@ -1176,7 +1197,7 @@
       }
     }
 
-    if (filters.maxBlockedLevel != null && record.authorLevel != null && record.authorLevel <= filters.maxBlockedLevel) {
+    if (shouldHideAuthorLevel(record.authorLevel, filters.maxBlockedLevel, filters.levelOperator)) {
       return false;
     }
 
@@ -1188,7 +1209,7 @@
 
     if (filters.days > 0) parts.push(`最近 ${filters.days} 天`);
     if (filters.usernames.length > 0) parts.push(`用户 ${filters.usernames.join(", ")}`);
-    if (filters.maxBlockedLevel != null) parts.push(`隐藏等级 <= ${filters.maxBlockedLevel}（未知保留）`);
+    if (filters.maxBlockedLevel != null) parts.push(`隐藏等级 ${getLevelOperatorLabel(filters.levelOperator)} ${filters.maxBlockedLevel}（未知保留）`);
 
     return parts.length ? `，过滤：${parts.join(" + ")}` : "";
   }
@@ -1255,7 +1276,7 @@
 
   function setBusy(panel, busy) {
     state.busy = busy;
-    panel.querySelectorAll("button, input").forEach(el => {
+    panel.querySelectorAll("button, input, select").forEach(el => {
       if (el.dataset.role === "cancel") {
         el.disabled = !busy;
       } else {
@@ -1264,26 +1285,29 @@
     });
   }
 
-  async function runSort(mode, panel, pageInput, dayInput, usernameInput, levelInput, concurrencyInput, setStatus) {
+  async function runSort(mode, panel, pageInput, dayInput, usernameInput, levelInput, levelOperatorInput, concurrencyInput, setStatus) {
     if (state.busy) return;
 
     const extraPages = clampPages(pageInput.value);
     const filterDays = clampDays(dayInput.value);
     const usernameText = String(usernameInput.value || "").trim();
     const maxBlockedLevel = clampLevelThreshold(levelInput.value);
+    const levelOperator = clampLevelOperator(levelOperatorInput.value);
     const levelConcurrency = clampLevelConcurrency(concurrencyInput.value);
-    const filters = makeFilters(filterDays, usernameText, maxBlockedLevel, levelConcurrency);
+    const filters = makeFilters(filterDays, usernameText, maxBlockedLevel, levelOperator, levelConcurrency);
 
     pageInput.value = String(extraPages);
     dayInput.value = filterDays > 0 ? String(filterDays) : "";
     usernameInput.value = usernameText;
     levelInput.value = maxBlockedLevel == null ? "" : String(maxBlockedLevel);
+    levelOperatorInput.value = levelOperator;
     concurrencyInput.value = String(levelConcurrency);
 
     setValue("extra_pages", extraPages);
     setValue("filter_days", filterDays);
     setValue("filter_username", usernameText);
     setValue("max_blocked_level", maxBlockedLevel);
+    setValue("level_operator", levelOperator);
     setValue("level_concurrency", levelConcurrency);
     setValue("sort_mode", mode);
 
@@ -1366,8 +1390,22 @@
         width: 74px;
       }
 
+      #nsmps-panel select[data-role="level-operator"] {
+        width: 58px;
+      }
+
       #nsmps-panel input[data-role="level-concurrency"] {
         width: 74px;
+      }
+
+      #nsmps-panel select {
+        min-height: 28px;
+        box-sizing: border-box;
+        border: 1px solid var(--border-color, rgba(127, 127, 127, .35));
+        border-radius: 4px;
+        padding: 2px 6px;
+        color: inherit;
+        background: var(--input-background-color, transparent);
       }
 
       #nsmps-panel button {
@@ -1386,7 +1424,8 @@
       }
 
       #nsmps-panel button:disabled,
-      #nsmps-panel input:disabled {
+      #nsmps-panel input:disabled,
+      #nsmps-panel select:disabled {
         cursor: not-allowed;
         opacity: .55;
       }
@@ -1710,7 +1749,11 @@
       <label>用户名
         <input data-role="username" type="text" placeholder="不限">
       </label>
-      <label>隐藏等级<=
+      <label>隐藏等级
+        <select data-role="level-operator">
+          <option value="lte">&lt;=</option>
+          <option value="gte">&gt;=</option>
+        </select>
         <input data-role="level" type="number" min="${MIN_USER_LEVEL}" max="${MAX_USER_LEVEL}" step="1" placeholder="关闭">
       </label>
       <label>等级并发
@@ -1727,6 +1770,7 @@
     const dayInput = panel.querySelector('[data-role="days"]');
     const usernameInput = panel.querySelector('[data-role="username"]');
     const levelInput = panel.querySelector('[data-role="level"]');
+    const levelOperatorInput = panel.querySelector('[data-role="level-operator"]');
     const concurrencyInput = panel.querySelector('[data-role="level-concurrency"]');
     const status = panel.querySelector("#nsmps-status");
     const setStatus = message => {
@@ -1737,6 +1781,7 @@
     dayInput.value = clampDays(getValue("filter_days", 0)) || "";
     usernameInput.value = String(getValue("filter_username", "") || "");
     levelInput.value = clampLevelThreshold(getValue("max_blocked_level", "")) ?? "";
+    levelOperatorInput.value = clampLevelOperator(getValue("level_operator", DEFAULT_LEVEL_OPERATOR));
     concurrencyInput.value = String(clampLevelConcurrency(getValue("level_concurrency", DEFAULT_USER_LEVEL_CONCURRENCY)));
 
     pageInput.addEventListener("change", () => {
@@ -1763,6 +1808,12 @@
       setValue("max_blocked_level", maxBlockedLevel);
     });
 
+    levelOperatorInput.addEventListener("change", () => {
+      const levelOperator = clampLevelOperator(levelOperatorInput.value);
+      levelOperatorInput.value = levelOperator;
+      setValue("level_operator", levelOperator);
+    });
+
     concurrencyInput.addEventListener("change", () => {
       const levelConcurrency = clampLevelConcurrency(concurrencyInput.value);
       concurrencyInput.value = String(levelConcurrency);
@@ -1770,11 +1821,11 @@
     });
 
     panel.querySelector('[data-role="sort-views"]').addEventListener("click", () => {
-      runSort("views", panel, pageInput, dayInput, usernameInput, levelInput, concurrencyInput, setStatus);
+      runSort("views", panel, pageInput, dayInput, usernameInput, levelInput, levelOperatorInput, concurrencyInput, setStatus);
     });
 
     panel.querySelector('[data-role="sort-comments"]').addEventListener("click", () => {
-      runSort("comments", panel, pageInput, dayInput, usernameInput, levelInput, concurrencyInput, setStatus);
+      runSort("comments", panel, pageInput, dayInput, usernameInput, levelInput, levelOperatorInput, concurrencyInput, setStatus);
     });
 
     panel.querySelector('[data-role="restore"]').addEventListener("click", () => {
