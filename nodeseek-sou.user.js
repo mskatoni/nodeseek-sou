@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         nodeseek-sou
 // @namespace    https://github.com/mskatoni/nodeseek-sou
-// @version      0.2.3
+// @version      0.2.4
 // @description  低内存友好的 NodeSeek 多页帖子抓取、过滤和排序工具。
 // @author       mskatoni
 // @homepageURL  https://github.com/mskatoni/nodeseek-sou
@@ -33,6 +33,7 @@
   const DB_NAME = "nodeseek-sou";
   const DB_VERSION = 1;
   const PAGE_CACHE_STORE = "page-cache";
+  const PAGE_CACHE_SCHEMA_VERSION = 2;
   const PAGE_CACHE_TTL_MS = 30 * 60 * 1000;
   const FETCH_DELAY_MS = 5000;
   const DEFAULT_BLOCK_INTERVAL_MS = 2000;
@@ -146,7 +147,11 @@
       const store = tx.objectStore(PAGE_CACHE_STORE);
       const cached = await idbRequest(store.get(getPageCacheKey(scopeKey, pageUrl)));
 
-      if (!cached || Date.now() - Number(cached.fetchedAt || 0) > PAGE_CACHE_TTL_MS) {
+      if (
+        !cached ||
+        cached.schemaVersion !== PAGE_CACHE_SCHEMA_VERSION ||
+        Date.now() - Number(cached.fetchedAt || 0) > PAGE_CACHE_TTL_MS
+      ) {
         return null;
       }
 
@@ -171,6 +176,7 @@
         pageUrl,
         nextHref,
         records,
+        schemaVersion: PAGE_CACHE_SCHEMA_VERSION,
         fetchedAt: Date.now(),
       };
 
@@ -307,8 +313,9 @@
       self.onmessage = event => {
         const { records, filters, mode } = event.data;
         const matched = records.filter(record => recordMatchesFilters(record, filters));
+        const sorted = sortRecords(matched, mode);
         self.postMessage({
-          records: sortRecords(matched, mode),
+          keys: sorted.map(record => record.key),
           matchedCount: matched.length
         });
       };
@@ -350,10 +357,14 @@
       }
 
       signal?.addEventListener("abort", onAbort, { once: true });
+      const recordByKey = new Map(records.map(record => [record.key, record]));
+      const workerRecords = records.map(({ html, ...record }) => record);
+
       worker.onmessage = event => {
         cleanup();
+        const sortedKeys = Array.isArray(event.data.keys) ? event.data.keys : [];
         resolve({
-          records: event.data.records || [],
+          records: sortedKeys.map(key => recordByKey.get(key)).filter(Boolean),
           matchedCount: Number(event.data.matchedCount || 0),
           usedWorker: true,
         });
@@ -362,7 +373,7 @@
         console.warn("[nodeseek-sou] Worker 处理失败，回退主线程", error);
         fallback();
       };
-      worker.postMessage({ records, filters, mode });
+      worker.postMessage({ records: workerRecords, filters, mode });
     });
   }
 
@@ -872,6 +883,7 @@
       createdAt,
       views: readMetric(item, "views"),
       comments: readMetric(item, "comments"),
+      html: item.outerHTML || "",
     };
     return record;
   }
@@ -1214,46 +1226,68 @@
     return parts.length ? `，过滤：${parts.join(" + ")}` : "";
   }
 
+  function decorateRenderedItem(item, record) {
+    item.classList.add("post-list-item");
+    item.dataset.nsmpsViews = String(record.views);
+    item.dataset.nsmpsComments = String(record.comments);
+    item.dataset.nsmpsSourcePage = String(record.pageIndex);
+    item.dataset.nsmpsAuthor = record.authorName;
+    item.dataset.nsmpsAuthorId = record.authorId;
+    item.dataset.nsmpsAuthorLevel = record.authorLevel == null ? "" : String(record.authorLevel);
+    item.dataset.nsmpsCreatedAt = String(record.createdAt || "");
+    return item;
+  }
+
+  function createFallbackRecordItem(record) {
+    const item = document.createElement("li");
+
+    const titleWrap = document.createElement("div");
+    titleWrap.className = "post-title";
+
+    const titleLink = document.createElement("a");
+    titleLink.href = record.href;
+    titleLink.textContent = record.title || record.href || "(无标题)";
+    titleWrap.appendChild(titleLink);
+
+    const info = document.createElement("div");
+    info.className = "post-info nsmps-lite-info";
+
+    const metaParts = [];
+    if (record.category) metaParts.push(record.category);
+    if (record.authorName) metaParts.push(`作者 ${record.authorName}`);
+    if (record.authorLevel != null) metaParts.push(`Lv${record.authorLevel}`);
+    if (record.createdAt) metaParts.push(formatTimestamp(record.createdAt));
+    metaParts.push(`浏览 ${record.views}`);
+    metaParts.push(`评论 ${record.comments}`);
+    metaParts.push(`来源第 ${record.pageIndex + 1} 页`);
+
+    info.textContent = metaParts.join(" · ");
+    item.append(titleWrap, info);
+    return decorateRenderedItem(item, record);
+  }
+
+  function createRecordItem(record) {
+    const html = String(record.html || "").trim();
+    if (!html) return createFallbackRecordItem(record);
+
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const item = template.content.firstElementChild;
+
+    if (!item || !item.matches(POST_ITEM_SELECTOR)) {
+      return createFallbackRecordItem(record);
+    }
+
+    return decorateRenderedItem(item, record);
+  }
+
   function renderRecords(records) {
     const list = getPostList();
     if (!list) throw new Error("未找到帖子列表");
 
     const fragment = document.createDocumentFragment();
-
     for (const record of records) {
-      const item = document.createElement("li");
-      item.className = "post-list-item";
-      item.dataset.nsmpsViews = String(record.views);
-      item.dataset.nsmpsComments = String(record.comments);
-      item.dataset.nsmpsSourcePage = String(record.pageIndex);
-      item.dataset.nsmpsAuthor = record.authorName;
-      item.dataset.nsmpsAuthorId = record.authorId;
-      item.dataset.nsmpsAuthorLevel = record.authorLevel == null ? "" : String(record.authorLevel);
-      item.dataset.nsmpsCreatedAt = String(record.createdAt || "");
-
-      const titleWrap = document.createElement("div");
-      titleWrap.className = "post-title";
-
-      const titleLink = document.createElement("a");
-      titleLink.href = record.href;
-      titleLink.textContent = record.title || record.href || "(无标题)";
-      titleWrap.appendChild(titleLink);
-
-      const info = document.createElement("div");
-      info.className = "post-info nsmps-lite-info";
-
-      const metaParts = [];
-      if (record.category) metaParts.push(record.category);
-      if (record.authorName) metaParts.push(`作者 ${record.authorName}`);
-      if (record.authorLevel != null) metaParts.push(`Lv${record.authorLevel}`);
-      if (record.createdAt) metaParts.push(formatTimestamp(record.createdAt));
-      metaParts.push(`浏览 ${record.views}`);
-      metaParts.push(`评论 ${record.comments}`);
-      metaParts.push(`来源第 ${record.pageIndex + 1} 页`);
-
-      info.textContent = metaParts.join(" · ");
-      item.append(titleWrap, info);
-      fragment.appendChild(item);
+      fragment.appendChild(createRecordItem(record));
     }
 
     list.replaceChildren(fragment);
@@ -1353,6 +1387,15 @@
     const style = document.createElement("style");
     style.id = "nsmps-style";
     style.textContent = `
+      #nsmps-container {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
+        clear: both;
+        flex: 0 0 100%;
+      }
+
       #nsmps-panel {
         display: flex;
         flex-wrap: wrap;
@@ -1360,6 +1403,10 @@
         gap: 8px;
         margin: 8px 0;
         padding: 8px 10px;
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
+        flex: 0 0 100%;
         border: 1px solid var(--border-color, rgba(127, 127, 127, .25));
         border-radius: 6px;
         background: var(--panel-background-color, var(--component-background-color, rgba(127, 127, 127, .08)));
@@ -1440,6 +1487,11 @@
       #nsmps-bulk-panel {
         margin: 0 0 8px;
         padding: 8px 10px;
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
+        flex: 0 0 100%;
         border: 1px solid var(--border-color, rgba(127, 127, 127, .25));
         border-radius: 6px;
         background: var(--panel-background-color, var(--component-background-color, rgba(127, 127, 127, .08)));
@@ -1459,10 +1511,17 @@
       }
 
       #nsmps-bulk-panel .nsmps-bulk-grid {
-        display: flex;
-        flex-wrap: wrap;
+        display: grid;
+        grid-template-columns: minmax(220px, 1fr) auto auto auto auto auto;
         align-items: center;
         gap: 8px;
+      }
+
+      #nsmps-bulk-panel label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
       }
 
       #nsmps-bulk-panel input {
@@ -1476,8 +1535,8 @@
       }
 
       #nsmps-bulk-panel input[data-role="block-keywords"] {
-        width: 280px;
-        max-width: min(58vw, 100%);
+        width: 100%;
+        min-width: 0;
       }
 
       #nsmps-bulk-panel input[data-role="block-threshold"] {
@@ -1546,6 +1605,37 @@
         color: var(--text-secondary-color, #777);
         font-size: 12px;
         line-height: 1.5;
+      }
+
+      @media (max-width: 640px) {
+        #nsmps-panel,
+        #nsmps-bulk-panel .nsmps-bulk-grid {
+          align-items: stretch;
+        }
+
+        #nsmps-panel label,
+        #nsmps-bulk-panel label {
+          width: 100%;
+          justify-content: space-between;
+        }
+
+        #nsmps-panel button,
+        #nsmps-bulk-panel button {
+          width: 100%;
+        }
+
+        #nsmps-panel input[data-role="username"],
+        #nsmps-bulk-panel input[data-role="block-keywords"],
+        #nsmps-bulk-panel input[data-role="block-threshold"],
+        #nsmps-bulk-panel input[data-role="block-interval"] {
+          width: 100%;
+          max-width: 100%;
+        }
+
+        #nsmps-bulk-panel .nsmps-bulk-grid {
+          display: flex;
+          flex-direction: column;
+        }
       }
     `;
     document.head.appendChild(style);
@@ -1838,14 +1928,19 @@
       setStatus("正在中止...");
     });
 
+    const container = document.createElement("div");
+    container.id = "nsmps-container";
+    container.appendChild(panel);
+
     const bulkPanel = createBulkBlockPanel();
+    if (bulkPanel) container.appendChild(bulkPanel);
+
     const anchor = $(".sorter") || $(".nsk-pager.pager-top") || list;
     if (anchor === list) {
-      list.before(panel);
+      list.before(container);
     } else {
-      anchor.after(panel);
+      anchor.after(container);
     }
-    if (bulkPanel) panel.after(bulkPanel);
 
     const lastMode = getValue("sort_mode", "");
     if (lastMode === "views" || lastMode === "comments") {
